@@ -1,39 +1,153 @@
-<!--
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
+# nip_append_only_list
 
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages).
+Local-first Dart implementation of the **Nostr append-only lists NIP**
+(kinds `1990` Add / `1991` Remove). Built on top of
+[`ndk`](https://pub.dev/packages/ndk) and
+[`broadcast_queue_shim_for_ndk`](https://pub.dev/packages/broadcast_queue_shim_for_ndk),
+with a sembast-backed cleartext projection so previously-decrypted private
+entries remain readable across restarts even before a signer reconnects.
 
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/tools/pub/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages).
--->
+## What this NIP solves
 
-TODO: Put a short description of the package here that helps potential users
-know whether this package might be useful for them.
+NIP-51 stores lists as *replaceable* events: every edit rewrites the whole
+list, and concurrent edits from different devices silently overwrite each
+other. This NIP keeps the NIP-51 tag/encrypted-content format unchanged but
+stores each addition or removal as its own regular event:
 
-## Features
+- `kind:1990` - Add one or more entries to a list
+- `kind:1991` - Remove one or more entries from a list
 
-TODO: List what your package can do. Maybe include images, gifs, or videos.
+State is computed client-side as an **OR-Set CRDT**: an entry `e` is a
+member of list `L` for author `P` iff `P` has signed at least one Add for
+`(L, e)` and no Remove for `(L, e)` with a strictly later `created_at`.
+Adds and Removes commute, so offline / multi-device edits converge without
+coordination.
 
-## Getting started
+## Local-first design
 
-TODO: List prerequisites and provide or point to information on how to
-start using the package.
+Three persistence layers are wired by the caller:
+
+1. **NDK `CacheManager`** - raw 1990/1991 events as received from relays
+   (encrypted content preserved). Used for incremental sync (`since:
+   <last_known_created_at>`).
+2. **Cleartext projection** (this package's `ProjectionStore`, sembast) -
+   per `(author, listName)` OR-Set bookkeeping in cleartext. Once a private
+   entry has been decrypted with a signer, it stays readable at every
+   subsequent boot, with or without the signer.
+3. **`OfflineBroadcast`** (from
+   `broadcast_queue_shim_for_ndk`) - durable outgoing queue. Writes return
+   as soon as the event is persisted; delivery survives restarts and
+   retries until every targeted relay acks.
+
+> **Security note**: the projection stores cleartext for what was originally
+> NIP-44 encrypted content. The caller is responsible for device-level
+> protection (disk encryption, app sandbox).
+
+## Install
+
+```yaml
+dependencies:
+  nip_append_only_list: ^0.1.0
+  ndk: ^0.8.4-dev.1
+  broadcast_queue_shim_for_ndk: ^0.2.0
+  sembast: ^3.8.7
+```
 
 ## Usage
 
-TODO: Include short and useful examples for package users. Add longer examples
-to `/example` folder.
-
 ```dart
-const like = 'sample';
+import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
+import 'package:ndk/ndk.dart';
+import 'package:nip_append_only_list/nip_append_only_list.dart';
+import 'package:sembast/sembast_io.dart'; // or sembast_web on web
+
+final ndk = Ndk(NdkConfig(
+  eventVerifier: Bip340EventVerifier(),
+  cache: await SembastCacheManager.create(databasePath: 'data'),
+));
+
+final outboxDb = await databaseFactoryIo.openDatabase('outbox.db');
+final projectionDb = await databaseFactoryIo.openDatabase('projection.db');
+
+final outbox = OfflineBroadcast.withNdk(ndk, db: outboxDb);
+outbox.start();
+
+final lists = AppendOnlyLists(
+  ndk: ndk,
+  outbox: outbox,
+  projection: ProjectionStore(projectionDb),
+  // Optional: cap the size of consolidation events so relays don't
+  // reject huge fresh-Adds or deletion bundles. Default 32 KB.
+  // maxEventBytes: 32 * 1024,
+);
+
+// Log an account into NDK so write methods pick up its signer
+// automatically. Alternatives: `ndk.accounts.loginExternalSigner(...)`
+// for a NIP-46 bunker / Amber / NIP-07 signer, or simply pass `signer:`
+// explicitly on every call.
+ndk.accounts.loginPrivateKey(pubkey: myPubkey, privkey: myPrivkey);
+
+// Add three entries to a list named "fruits".
+// `relays` is optional; when omitted, the author's NIP-65 write relays
+// are resolved automatically via NDK.
+await lists.add(
+  listName: 'fruits',
+  entries: const [
+    AppendOnlyListEntry(tag: 't', value: 'apple'),
+    AppendOnlyListEntry(tag: 't', value: 'banana'),
+    AppendOnlyListEntry(tag: 't', value: 'cherry', private: true), // encrypted
+  ],
+);
+
+// Remove one.
+await lists.remove(
+  listName: 'fruits',
+  entries: const [AppendOnlyListEntry(tag: 't', value: 'banana')],
+);
+
+// Read - works offline, no signer needed for entries already projected.
+final state = await lists.getList(
+  pubkey: myPubkey,
+  listName: 'fruits',
+);
+print(state.entries); // {apple, cherry (private)}
+
+// Reactive view (initial snapshot + live updates).
+final sub = lists.watchList(
+  pubkey: myPubkey,
+  listName: 'fruits',
+).listen((s) => print(s.entries));
+
+// Periodically compact: emits a fresh Add capturing current state and
+// NIP-09-deletes the superseded events.
+await lists.consolidate(listName: 'fruits');
+
+await sub.cancel();
+await lists.dispose();
 ```
 
-## Additional information
+## API surface
 
-TODO: Tell users more about the package: where to find more information, how to
-contribute to the package, how to file issues, what response they can expect
-from the package authors, and more.
+| Symbol | Purpose |
+|---|---|
+| `AppendOnlyListEntry` | `(tag, value, private?)` - identity is `(tag, value)` |
+| `AppendOnlyListOp` | `add` (kind 1990) / `remove` (kind 1991) |
+| `AppendOnlyListEvent` | Parsed event with separated public/private entries |
+| `AppendOnlyListState` | Folded OR-Set state for one `(author, listName)` |
+| `EntryStat` | Per-entry timestamps and presence test |
+| `buildAppendOnlyEvent(...)` | Builds (unsigned) 1990/1991 events; encrypts private entries |
+| `listFilter` / `deletionFilter` | NDK `Filter` builders |
+| `ProjectionStore` | Sembast-backed cleartext state store |
+| `AppendOnlyLists` | High-level usecase: read / write / watch / consolidate |
+
+The CRDT core (`AppendOnlyListState.fromEvents`, `foldEvents`) is pure and
+has no NDK dependency at runtime - it can be used standalone to fold any
+collection of parsed events into a resolved set.
+
+## Compatibility with NIP-51
+
+This NIP is **complementary** to NIP-51, not a replacement. The two are
+intended to coexist: NIP-51 remains appropriate for human-curated,
+low-volume, mono-device lists; this NIP targets high-volume, automated,
+multi-device, and offline-first workflows. Clients may mirror state between
+the two for interoperability.
