@@ -1,3 +1,7 @@
+## 0.1.1
+
+- Remove subscription `name`.
+
 ## 0.1.0
 
 Initial release.

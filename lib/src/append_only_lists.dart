@@ -248,7 +248,6 @@ class AppendOnlyLists {
         final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
         sub = _ndk.requests.subscription(
           filter: listFilter(pubkey: pubkey, listName: listName, since: now),
-          name: 'append-only-list-$key',
           explicitRelays: resolvedRelays,
           cacheWrite: true,
         );
