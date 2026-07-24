@@ -456,7 +456,11 @@ class AppendOnlyLists {
         );
         final signedDeletion = await eventSigner.sign(deletion);
         await _cache.saveEvent(signedDeletion);
-        await outbox.broadcast(signedDeletion, relays: resolvedRelays);
+        await outbox.broadcast(
+          signedDeletion,
+          relays: resolvedRelays,
+          pubkey: pubkey,
+        );
       }
       // Trim local cache once every deletion has been queued for delivery.
       for (final id in supersededIds) {
@@ -561,6 +565,120 @@ class AppendOnlyLists {
     _controllers.clear();
   }
 
+  // -------------------------------------------------------- Local cache reset
+
+  /// Erases every local trace of [pubkey]'s append-only lists and returns the
+  /// device to a clean, re-syncable state:
+  ///
+  ///   * the sembast projection (state, tombstones, cached plaintext);
+  ///   * the raw 1990/1991 events and the author's list-related kind 5
+  ///     deletions in the NDK cache;
+  ///   * the NDK fetched-range bookmarks for those lists, so the next read
+  ///     re-fetches from relays instead of assuming the ranges are covered.
+  ///
+  /// Active [watchList] streams for [pubkey] are closed. The injected outbox
+  /// is caller-owned and may be shared with other features, and its clear is
+  /// by-account (not scopeable to append-only kinds), so it is left untouched
+  /// here: anything already queued for delivery still reaches its relays.
+  /// Writes are attributed to [pubkey], so a caller owning a dedicated outbox
+  /// can drop this account's pending sends on logout with
+  /// `outbox.clearLocalAccountData(pubkey: pubkey)`. Nothing is published.
+  Future<void> clearLocalAccountData({required String pubkey}) async {
+    await _closeControllersFor(pubkey);
+
+    final events = await _cache.loadEvents(
+      pubKeys: [pubkey],
+      kinds: appendOnlyKinds,
+    );
+    final eventIds = events.map((e) => e.id).toList(growable: false);
+    final listNames = events
+        .map((e) => e.getDtag())
+        .whereType<String>()
+        .toSet();
+
+    await projection.clearAccount(pubkey: pubkey, eventIds: eventIds);
+
+    await _cache.removeEvents(pubKeys: [pubkey], kinds: appendOnlyKinds);
+    await _cache.removeEvents(
+      pubKeys: [pubkey],
+      kinds: const [5],
+      tags: {
+        'k': [for (final k in appendOnlyKinds) '$k'],
+      },
+    );
+
+    // ignore: experimental_member_use
+    await _ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+    for (final listName in listNames) {
+      // ignore: experimental_member_use
+      await _ndk.fetchedRanges.clearForFilter(
+        listFilter(pubkey: pubkey, listName: listName),
+      );
+    }
+  }
+
+  /// Erases all local append-only-list data on this device, every account
+  /// included: the entire projection store, plus every 1990/1991 event, the
+  /// matching kind 5 deletions and the fetched-range bookmarks in the NDK
+  /// cache. Every active [watchList] stream is closed.
+  ///
+  /// Stays within the package's scope: unrelated NDK cache data (metadata,
+  /// contacts, other kinds) and fetched-range bookmarks for other filters are
+  /// left in place. The caller-owned outbox is untouched too (see
+  /// [clearLocalAccountData]); nothing is published.
+  ///
+  /// Fetched-range bookmarks are cleared per known filter, reconstructed from
+  /// the cached events before they are wiped. A bookmark for a list with no
+  /// remaining cached events is left behind - harmless, since nothing
+  /// references it anymore.
+  Future<void> clearAllLocalData() async {
+    for (final c in _controllers.values) {
+      await c.close();
+    }
+    _controllers.clear();
+
+    final events = await _cache.loadEvents(kinds: appendOnlyKinds);
+    final pubkeys = <String>{};
+    final listPairs = <(String, String)>{};
+    for (final e in events) {
+      pubkeys.add(e.pubKey);
+      final listName = e.getDtag();
+      if (listName != null) listPairs.add((e.pubKey, listName));
+    }
+
+    await projection.clearAll();
+
+    await _cache.removeEvents(kinds: appendOnlyKinds);
+    await _cache.removeEvents(
+      kinds: const [5],
+      tags: {
+        'k': [for (final k in appendOnlyKinds) '$k'],
+      },
+    );
+
+    for (final pubkey in pubkeys) {
+      // ignore: experimental_member_use
+      await _ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+    }
+    for (final (pubkey, listName) in listPairs) {
+      // ignore: experimental_member_use
+      await _ndk.fetchedRanges.clearForFilter(
+        listFilter(pubkey: pubkey, listName: listName),
+      );
+    }
+  }
+
+  Future<void> _closeControllersFor(String pubkey) async {
+    final prefix = '$pubkey|';
+    final keys = _controllers.keys
+        .where((k) => k.startsWith(prefix))
+        .toList(growable: false);
+    for (final key in keys) {
+      final controller = _controllers.remove(key);
+      if (controller != null) await controller.close();
+    }
+  }
+
   // ----------------------------------------------------------------- Private
 
   Future<QueuedBroadcast> _emit({
@@ -602,7 +720,7 @@ class AppendOnlyLists {
     if (parsed != null) {
       await _applyToProjection(parsed);
     }
-    return outbox.broadcast(signed, relays: relays);
+    return outbox.broadcast(signed, relays: relays, pubkey: pubkey);
   }
 
   Future<AppendOnlyListState> _replayCache({

@@ -66,6 +66,41 @@ class ProjectionStore {
     await _store.record(_key(pubkey, listName)).delete(_db);
   }
 
+  /// Deletes every projection and tombstone record for [pubkey] across all
+  /// of its lists. The plaintext store is keyed by event id rather than
+  /// pubkey, so it can only be pruned when the caller supplies the relevant
+  /// [eventIds] (read from the NDK cache before the raw events are evicted);
+  /// an empty iterable leaves it untouched.
+  Future<void> clearAccount({
+    required String pubkey,
+    Iterable<String> eventIds = const [],
+  }) async {
+    final prefix = '$pubkey|';
+    await _deletePrefixed(_store, prefix);
+    await _deletePrefixed(_tombstoneStore, prefix);
+    await deleteDecryptedPlaintext(eventIds);
+  }
+
+  /// Wipes all three stores (state, tombstones, cached plaintext), leaving
+  /// the database open and reusable.
+  Future<void> clearAll() async {
+    await _store.delete(_db);
+    await _tombstoneStore.delete(_db);
+    await _plaintextStore.delete(_db);
+  }
+
+  Future<void> _deletePrefixed(
+    StoreRef<String, Map<String, Object?>> store,
+    String prefix,
+  ) async {
+    final keys = await store.findKeys(_db);
+    final matching = keys
+        .where((k) => k.startsWith(prefix))
+        .toList(growable: false);
+    if (matching.isEmpty) return;
+    await store.records(matching).delete(_db);
+  }
+
   /// Loads the set of NIP-09-tombstoned event ids for `(pubkey, listName)`.
   Future<Set<String>> loadTombstones({
     required String pubkey,

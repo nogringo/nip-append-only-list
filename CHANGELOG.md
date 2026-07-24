@@ -1,3 +1,16 @@
+## 0.2.0
+
+- Add `AppendOnlyLists.clearLocalAccountData({pubkey})` and
+  `clearAllLocalData()` for a purely local reset: wipe the sembast projection
+  (state, tombstones, cached plaintext), the pubkey's 1990/1991 events and
+  matching kind 5 deletions in the NDK cache, and the fetched-range bookmarks
+  for those lists so the next read re-syncs from relays. Active `watchList`
+  streams are closed; the outbox is left untouched and nothing is published.
+- Attribute every queued broadcast to its author (`pubkey:` on
+  `outbox.broadcast`), so a caller owning a dedicated outbox can clear an
+  account's pending sends on logout. Requires
+  `broadcast_queue_shim_for_ndk ^0.4.0`.
+
 ## 0.1.1
 
 - Remove subscription `name`.

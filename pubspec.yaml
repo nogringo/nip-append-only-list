@@ -1,6 +1,6 @@
 name: nip_append_only_list
 description: Local-first Dart implementation of the Nostr append-only lists NIP (kinds 1990/1991) on top of NDK.
-version: 0.1.1
+version: 0.2.0
 repository: https://github.com/nogringo/nip-append-only-list
 
 environment:
@@ -8,7 +8,7 @@ environment:
 
 dependencies:
   ndk: ^0.8.4-dev.1
-  broadcast_queue_shim_for_ndk: ^0.2.0
+  broadcast_queue_shim_for_ndk: ^0.4.0
   sembast: ^3.8.7
 
 dev_dependencies:

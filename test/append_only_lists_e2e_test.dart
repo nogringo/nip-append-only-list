@@ -506,6 +506,126 @@ void main() {
       // The deletion should reference the 3 superseded events.
       expect(eTags, hasLength(3));
     });
+
+    test(
+      'clearLocalAccountData wipes every local trace and stays re-syncable',
+      () async {
+        await lists.add(
+          listName: 'fruits',
+          entries: const [
+            AppendOnlyListEntry(tag: 't', value: 'apple'),
+            AppendOnlyListEntry(tag: 't', value: 'banana', private: true),
+          ],
+          relays: [relay.url],
+        );
+        await lists.add(
+          listName: 'veggies',
+          entries: const [AppendOnlyListEntry(tag: 't', value: 'carrot')],
+          relays: [relay.url],
+        );
+        await _waitForRelayCount(relay, 2);
+
+        final cachedIds = (await ndk.config.cache.loadEvents(
+          pubKeys: [pubkey],
+          kinds: appendOnlyKinds,
+        )).map((e) => e.id).toList();
+        expect(cachedIds, isNotEmpty);
+
+        await lists.clearLocalAccountData(pubkey: pubkey);
+
+        // Projection empty for every list of the pubkey.
+        final fruits = await lists.projection.load(
+          pubkey: pubkey,
+          listName: 'fruits',
+        );
+        final veggies = await lists.projection.load(
+          pubkey: pubkey,
+          listName: 'veggies',
+        );
+        expect(fruits.stats, isEmpty);
+        expect(veggies.stats, isEmpty);
+
+        // NDK cache no longer holds the pubkey's append-only events, and the
+        // cached plaintext of the private entry is gone.
+        final afterCache = await ndk.config.cache.loadEvents(
+          pubKeys: [pubkey],
+          kinds: appendOnlyKinds,
+        );
+        expect(afterCache, isEmpty);
+        for (final id in cachedIds) {
+          expect(await lists.projection.loadDecryptedPlaintext(id), isNull);
+        }
+
+        // Offline read (no relays) stays empty.
+        final offline = await lists.getList(pubkey: pubkey, listName: 'fruits');
+        expect(offline.entries, isEmpty);
+
+        // A forced refresh re-hydrates from the relay, proving the
+        // fetched-range bookmarks were cleared too.
+        final resynced = await lists.getList(
+          pubkey: pubkey,
+          listName: 'fruits',
+          forceRefresh: true,
+          relays: [relay.url],
+        );
+        expect(
+          resynced.entries.map((e) => e.value).toSet(),
+          equals({'apple', 'banana'}),
+        );
+      },
+    );
+
+    test('clearAllLocalData wipes every list on the device', () async {
+      await lists.add(
+        listName: 'fruits',
+        entries: const [AppendOnlyListEntry(tag: 't', value: 'apple')],
+        relays: [relay.url],
+      );
+      await lists.add(
+        listName: 'veggies',
+        entries: const [AppendOnlyListEntry(tag: 't', value: 'carrot')],
+        relays: [relay.url],
+      );
+      await _waitForRelayCount(relay, 2);
+
+      await lists.clearAllLocalData();
+
+      final fruits = await lists.getList(pubkey: pubkey, listName: 'fruits');
+      final veggies = await lists.getList(pubkey: pubkey, listName: 'veggies');
+      expect(fruits.entries, isEmpty);
+      expect(veggies.entries, isEmpty);
+
+      final cache = await ndk.config.cache.loadEvents(kinds: appendOnlyKinds);
+      expect(cache, isEmpty);
+
+      // Surgical fetched-range clearing hit the right fingerprints: a forced
+      // refresh re-hydrates from the relay instead of assuming it's covered.
+      final resynced = await lists.getList(
+        pubkey: pubkey,
+        listName: 'fruits',
+        forceRefresh: true,
+        relays: [relay.url],
+      );
+      expect(resynced.entries.map((e) => e.value).toSet(), equals({'apple'}));
+    });
+
+    test('queued broadcasts are attributed to the author pubkey', () async {
+      final added = await lists.add(
+        listName: 'fruits',
+        entries: const [AppendOnlyListEntry(tag: 't', value: 'apple')],
+        relays: [relay.url],
+      );
+      final removed = await lists.remove(
+        listName: 'fruits',
+        entries: const [AppendOnlyListEntry(tag: 't', value: 'apple')],
+        relays: [relay.url],
+      );
+
+      // Attribution is what lets a caller-owned outbox clear an account's
+      // pending sends by pubkey on logout.
+      expect(added.pubkey, equals(pubkey));
+      expect(removed.pubkey, equals(pubkey));
+    });
   });
 }
 
