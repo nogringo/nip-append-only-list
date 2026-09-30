@@ -26,6 +26,12 @@
   coverage is fresh.
 - Sync requests go out anonymously: a relay that serves reads only after
   NIP-42 AUTH is no longer read.
+- `AppendOnlyListEntry.extras` carries the tag elements after the value
+  (relay hints, petnames, app data such as `["t", "apple", "like"]`), public
+  or private. They are not part of identity: the most recent Add sets them,
+  ties on `created_at` resolve the same on every device, and `consolidate`
+  re-emits them. They used to be dropped; a projection written by an earlier
+  version picks them up on its next sync while the events are still cached.
 
 ## 0.2.0
 

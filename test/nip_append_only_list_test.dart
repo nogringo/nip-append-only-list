@@ -22,6 +22,17 @@ void main() {
         isNot(equals(const AppendOnlyListEntry(tag: 'p', value: 'apple'))),
       );
     });
+
+    test('equality ignores extras', () {
+      const a = AppendOnlyListEntry(tag: 't', value: 'apple', extras: ['like']);
+      const b = AppendOnlyListEntry(
+        tag: 't',
+        value: 'apple',
+        extras: ['dislike'],
+      );
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+    });
   });
 
   group('EntryStat (OR-Set semantics)', () {
@@ -64,6 +75,44 @@ void main() {
       expect(a.isPresent, equals(b.isPresent));
       expect(a.lastAddAt, equals(b.lastAddAt));
       expect(a.lastRemoveAt, equals(b.lastRemoveAt));
+    });
+
+    test('Most recent Add sets the extras', () {
+      final s = const EntryStat()
+          .applyAdd(20, private: false, extras: ['like'])
+          .applyAdd(10, private: false, extras: ['dislike']);
+      expect(s.extrasOnLastAdd, equals(['like']));
+      expect(
+        s.applyAdd(30, private: false).extrasOnLastAdd,
+        isEmpty,
+        reason: 'an Add without extras clears them',
+      );
+    });
+
+    test('Remove keeps the extras of the last Add', () {
+      final s = const EntryStat()
+          .applyAdd(10, private: false, extras: ['like'])
+          .applyRemove(20);
+      expect(s.isPresent, isFalse);
+      expect(s.extrasOnLastAdd, equals(['like']));
+    });
+
+    test('Adds tied on created_at resolve the same in any order', () {
+      final adds = <(List<String>, bool)>[
+        (const [], true),
+        (const ['dislike'], false),
+        (const ['like'], false),
+        (const ['like'], true),
+        (const ['like', 'x'], false),
+      ];
+      for (final order in [adds, adds.reversed.toList()]) {
+        var s = const EntryStat();
+        for (final (extras, private) in order) {
+          s = s.applyAdd(10, private: private, extras: extras);
+        }
+        expect(s.extrasOnLastAdd, equals(['like', 'x']));
+        expect(s.privateOnLastAdd, isFalse);
+      }
     });
 
     test('Idempotent on repeated Add at same timestamp', () {
@@ -132,6 +181,30 @@ void main() {
       expect(state.entries.map((e) => e.value), equals({'apple'}));
     });
 
+    test('An opinion changes with a later Add and goes away on Remove', () {
+      final state = AppendOnlyListState.foldEvents(
+        [
+          ev(AppendOnlyListOp.add, 1, const [
+            AppendOnlyListEntry(tag: 't', value: 'apple', extras: ['like']),
+            AppendOnlyListEntry(tag: 't', value: 'durian', extras: ['dislike']),
+          ]),
+          ev(AppendOnlyListOp.add, 2, const [
+            AppendOnlyListEntry(tag: 't', value: 'durian', extras: ['like']),
+          ]),
+          ev(AppendOnlyListOp.remove, 3, const [
+            AppendOnlyListEntry(tag: 't', value: 'apple'),
+          ]),
+        ],
+        listName: 'fruits',
+        pubkey: 'deadbeef',
+      );
+      expect(state.entries, hasLength(1));
+      final durian = state.entries.lookup(
+        const AppendOnlyListEntry(tag: 't', value: 'durian'),
+      );
+      expect(durian?.extras, equals(['like']));
+    });
+
     test('Re-add after remove resurrects the entry', () {
       final state = AppendOnlyListState.foldEvents(
         [
@@ -181,6 +254,71 @@ void main() {
           pubkey: 'deadbeef',
         ),
         throwsStateError,
+      );
+    });
+  });
+
+  group('extras', () {
+    test('public and private extras survive build then parse', () async {
+      final signer = const Bip340EventSignerFactory().createWithNewKeyPair();
+      final raw = await buildAppendOnlyEvent(
+        op: AppendOnlyListOp.add,
+        listName: 'fruits',
+        entries: const [
+          AppendOnlyListEntry(tag: 't', value: 'apple', extras: ['like']),
+          AppendOnlyListEntry(
+            tag: 'p',
+            value: 'abc',
+            private: true,
+            extras: ['wss://relay.example', 'alice'],
+          ),
+        ],
+        pubkey: signer.getPublicKey(),
+        signer: signer,
+        createdAt: 1000,
+      );
+      expect(raw.tags, contains(equals(['t', 'apple', 'like'])));
+
+      final plaintext = await signer.decryptNip44(
+        ciphertext: raw.content,
+        senderPubKey: signer.getPublicKey(),
+      );
+      final parsed = AppendOnlyListEvent.parse(raw, plaintext: plaintext)!;
+      expect(
+        [for (final e in parsed.entries) e.toTag()],
+        equals([
+          ['t', 'apple', 'like'],
+          ['p', 'abc', 'wss://relay.example', 'alice'],
+        ]),
+      );
+    });
+
+    test('ProjectionStore persists extras', () async {
+      final db = await newDatabaseFactoryMemory().openDatabase('extras.db');
+      final store = ProjectionStore(db);
+      await store.save(
+        AppendOnlyListState(
+          listName: 'fruits',
+          pubkey: 'deadbeef',
+          stats: {
+            const AppendOnlyListEntry(tag: 't', value: 'apple'):
+                const EntryStat(lastAddAt: 10, extrasOnLastAdd: ['like']),
+            const AppendOnlyListEntry(tag: 't', value: 'cherry'):
+                const EntryStat(lastAddAt: 10),
+          },
+          pendingDecryptionEventIds: const {},
+        ),
+      );
+
+      final loaded = await ProjectionStore(
+        db,
+      ).load(pubkey: 'deadbeef', listName: 'fruits');
+      expect(
+        {for (final e in loaded.entries) e.value: e.extras},
+        equals({
+          'apple': ['like'],
+          'cherry': <String>[],
+        }),
       );
     });
   });

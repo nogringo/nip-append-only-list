@@ -120,6 +120,17 @@ await lists.remove(
   entries: const [AppendOnlyListEntry(tag: 't', value: 'banana')],
 );
 
+// Tag elements after the value (relay hints, petnames, app data) ride
+// along in `extras`. They are not part of identity: the most recent Add
+// sets them, and a Remove drops the entry whatever its extras.
+await lists.add(
+  listName: 'fruit-opinions',
+  entries: const [
+    AppendOnlyListEntry(tag: 't', value: 'apple', extras: ['like']),
+    AppendOnlyListEntry(tag: 't', value: 'durian', extras: ['dislike']),
+  ],
+);
+
 // Read - works offline, no signer needed for entries already projected.
 final state = await lists.getList(
   pubkey: myPubkey,
@@ -146,7 +157,7 @@ await lists.dispose();
 
 | Symbol | Purpose |
 |---|---|
-| `AppendOnlyListEntry` | `(tag, value, private?)` - identity is `(tag, value)` |
+| `AppendOnlyListEntry` | `(tag, value, private?, extras?)`, identity is `(tag, value)` |
 | `AppendOnlyListOp` | `add` (kind 1990) / `remove` (kind 1991) |
 | `AppendOnlyListEvent` | Parsed event with separated public/private entries |
 | `AppendOnlyListState` | Folded OR-Set state for one `(author, listName)` |

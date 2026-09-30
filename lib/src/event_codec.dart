@@ -70,7 +70,11 @@ class AppendOnlyListEvent {
       // Accept any single-letter or short tag as an entry; the spec
       // inherits NIP-51's tag set without enumerating it.
       entries.add(
-        AppendOnlyListEntry(tag: tagName, value: tag[1], private: false),
+        AppendOnlyListEntry(
+          tag: tagName,
+          value: tag[1],
+          extras: tag.sublist(2),
+        ),
       );
     }
 
@@ -86,6 +90,7 @@ class AppendOnlyListEvent {
                 tag: raw[0].toString(),
                 value: raw[1].toString(),
                 private: true,
+                extras: [for (final x in raw.skip(2)) x.toString()],
               ),
             );
           }
@@ -111,8 +116,9 @@ class AppendOnlyListEvent {
 /// Builds (but does not sign or broadcast) a kind 1990 / 1991 event.
 ///
 /// Public entries become event tags; private entries are encrypted as a
-/// JSON array of `[tag, value]` tuples into the event content using NIP-44
-/// self-encryption. [signer] is required when any entry is private.
+/// JSON array of `[tag, value, ...extras]` tuples into the event content
+/// using NIP-44 self-encryption. [signer] is required when any entry is
+/// private.
 Future<Nip01Event> buildAppendOnlyEvent({
   required AppendOnlyListOp op,
   required String listName,
@@ -133,14 +139,12 @@ Future<Nip01Event> buildAppendOnlyEvent({
 
   final tags = <List<String>>[
     <String>[dTag, listName],
-    for (final e in publicEntries) <String>[e.tag, e.value],
+    for (final e in publicEntries) e.toTag(),
   ];
 
   var content = '';
   if (privateEntries.isNotEmpty) {
-    final plaintext = jsonEncode(
-      privateEntries.map((e) => [e.tag, e.value]).toList(),
-    );
+    final plaintext = jsonEncode(privateEntries.map((e) => e.toTag()).toList());
     final cipher = await signer!.encryptNip44(
       plaintext: plaintext,
       recipientPubKey: signer.getPublicKey(),

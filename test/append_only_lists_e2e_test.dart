@@ -540,6 +540,40 @@ void main() {
       expect(eTags, hasLength(3));
     });
 
+    test('consolidate re-emits the extras of every entry', () async {
+      await lists.add(
+        listName: 'fruit-opinions',
+        entries: const [
+          AppendOnlyListEntry(tag: 't', value: 'apple', extras: ['like']),
+          AppendOnlyListEntry(
+            tag: 't',
+            value: 'durian',
+            private: true,
+            extras: ['dislike'],
+          ),
+        ],
+        relays: [relay.url],
+      );
+      await _waitForRelayCount(relay, 1);
+
+      await lists.consolidate(listName: 'fruit-opinions', relays: [relay.url]);
+      await _waitForRelayCount(relay, 3, timeout: const Duration(seconds: 5));
+
+      final fresh = relay.receivedEvents.lastWhere((e) => e.kind == kindAdd);
+      expect(fresh.tags, contains(equals(['t', 'apple', 'like'])));
+
+      final state = await lists.getList(
+        pubkey: pubkey,
+        listName: 'fruit-opinions',
+      );
+      AppendOnlyListEntry entry(String value) =>
+          state.entries.lookup(AppendOnlyListEntry(tag: 't', value: value))!;
+      expect(entry('apple').extras, equals(['like']));
+      expect(entry('apple').private, isFalse);
+      expect(entry('durian').extras, equals(['dislike']));
+      expect(entry('durian').private, isTrue);
+    });
+
     test(
       'clearLocalAccountData wipes every local trace and stays re-syncable',
       () async {

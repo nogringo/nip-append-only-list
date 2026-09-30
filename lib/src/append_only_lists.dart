@@ -608,13 +608,16 @@ class AppendOnlyLists {
     var plaintextBytes = 0;
     var privateCount = 0;
     for (final e in entries) {
+      // Tag JSON: ,["<tag>","<value>"] plus ,"<extra>" per extra element.
+      var tagBytes = 8 + e.tag.length + e.value.length;
+      for (final x in e.extras) {
+        tagBytes += 3 + x.length;
+      }
       if (e.private) {
-        // [tag, value] JSON inside the content array.
-        plaintextBytes += 8 + e.tag.length + e.value.length;
+        plaintextBytes += tagBytes;
         privateCount++;
       } else {
-        // Public tag JSON: ,["<tag>","<value>"]
-        bytes += 8 + e.tag.length + e.value.length;
+        bytes += tagBytes;
       }
     }
     if (privateCount > 0) {
@@ -1004,10 +1007,14 @@ class AppendOnlyLists {
   ) {
     final stats = Map<AppendOnlyListEntry, EntryStat>.from(current.stats);
     for (final entry in event.entries) {
-      final key = entry.copyWith(private: false);
+      final key = entry.identity;
       final prev = stats[key] ?? const EntryStat();
       stats[key] = event.op == AppendOnlyListOp.add
-          ? prev.applyAdd(event.createdAt, private: entry.private)
+          ? prev.applyAdd(
+              event.createdAt,
+              private: entry.private,
+              extras: entry.extras,
+            )
           : prev.applyRemove(event.createdAt);
     }
     final pending = Set<String>.from(current.pendingDecryptionEventIds);

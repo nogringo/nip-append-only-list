@@ -22,10 +22,15 @@ class EntryStat {
   /// visibility. Ignored when the entry is currently removed.
   final bool privateOnLastAdd;
 
+  /// Tag elements after the value in the **most recent Add**, re-emitted by
+  /// consolidation. Ignored when the entry is currently removed.
+  final List<String> extrasOnLastAdd;
+
   const EntryStat({
     this.lastAddAt,
     this.lastRemoveAt,
     this.privateOnLastAdd = false,
+    this.extrasOnLastAdd = const [],
   });
 
   /// True iff the entry is currently a member of the list.
@@ -33,12 +38,22 @@ class EntryStat {
       lastAddAt != null &&
       (lastRemoveAt == null || lastAddAt! >= lastRemoveAt!);
 
-  EntryStat applyAdd(int createdAt, {required bool private}) {
-    final newer = lastAddAt == null || createdAt > lastAddAt!;
+  EntryStat applyAdd(
+    int createdAt, {
+    required bool private,
+    List<String> extras = const [],
+  }) {
+    final wins =
+        lastAddAt == null ||
+        createdAt > lastAddAt! ||
+        (createdAt == lastAddAt! &&
+            _compareAdds(extras, private, extrasOnLastAdd, privateOnLastAdd) >
+                0);
     return EntryStat(
-      lastAddAt: newer ? createdAt : lastAddAt,
+      lastAddAt: wins ? createdAt : lastAddAt,
       lastRemoveAt: lastRemoveAt,
-      privateOnLastAdd: newer ? private : privateOnLastAdd,
+      privateOnLastAdd: wins ? private : privateOnLastAdd,
+      extrasOnLastAdd: wins ? extras : extrasOnLastAdd,
     );
   }
 
@@ -48,7 +63,26 @@ class EntryStat {
         ? createdAt
         : lastRemoveAt,
     privateOnLastAdd: privateOnLastAdd,
+    extrasOnLastAdd: extrasOnLastAdd,
   );
+}
+
+/// Orders two Adds sharing a `created_at` so every device keeps the same one
+/// whatever the arrival order: greater extras win, then private over public.
+int _compareAdds(
+  List<String> extrasA,
+  bool privateA,
+  List<String> extrasB,
+  bool privateB,
+) {
+  for (var i = 0; i < extrasA.length && i < extrasB.length; i++) {
+    final c = extrasA[i].compareTo(extrasB[i]);
+    if (c != 0) return c;
+  }
+  if (extrasA.length != extrasB.length) {
+    return extrasA.length - extrasB.length;
+  }
+  return (privateA ? 1 : 0) - (privateB ? 1 : 0);
 }
 
 /// Resolved state of an append-only list for a single (author, listName).
@@ -84,12 +118,18 @@ class AppendOnlyListState {
     pendingDecryptionEventIds: const {},
   );
 
-  /// Currently-present entries, with their last-known privacy flag.
+  /// Currently-present entries, with the privacy flag and extras of their
+  /// most recent Add.
   Set<AppendOnlyListEntry> get entries {
     final out = <AppendOnlyListEntry>{};
     stats.forEach((entry, stat) {
       if (stat.isPresent) {
-        out.add(entry.copyWith(private: stat.privateOnLastAdd));
+        out.add(
+          entry.copyWith(
+            private: stat.privateOnLastAdd,
+            extras: stat.extrasOnLastAdd,
+          ),
+        );
       }
     });
     return out;
@@ -117,10 +157,14 @@ class AppendOnlyListState {
         pending.remove(e.eventId);
       }
       for (final entry in e.entries) {
-        final key = entry.copyWith(private: false); // identity ignores private
+        final key = entry.identity;
         final cur = stats[key] ?? const EntryStat();
         stats[key] = e.op == AppendOnlyListOp.add
-            ? cur.applyAdd(e.createdAt, private: entry.private)
+            ? cur.applyAdd(
+                e.createdAt,
+                private: entry.private,
+                extras: entry.extras,
+              )
             : cur.applyRemove(e.createdAt);
       }
     }

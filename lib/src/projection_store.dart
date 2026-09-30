@@ -214,6 +214,7 @@ class ProjectionStore {
         'a': stat.lastAddAt,
         'r': stat.lastRemoveAt,
         'p': stat.privateOnLastAdd,
+        if (stat.extrasOnLastAdd.isNotEmpty) 'x': stat.extrasOnLastAdd,
       });
     });
     return <String, Object?>{
@@ -232,6 +233,7 @@ class ProjectionStore {
     if (entries is List) {
       for (final raw in entries) {
         if (raw is! Map) continue;
+        final extras = raw['x'];
         stats[AppendOnlyListEntry(
           tag: raw['t'].toString(),
           value: raw['v'].toString(),
@@ -239,6 +241,9 @@ class ProjectionStore {
           lastAddAt: raw['a'] as int?,
           lastRemoveAt: raw['r'] as int?,
           privateOnLastAdd: raw['p'] as bool? ?? false,
+          extrasOnLastAdd: extras is List
+              ? [for (final x in extras) x.toString()]
+              : const [],
         );
       }
     }
