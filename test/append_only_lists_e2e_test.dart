@@ -1,8 +1,11 @@
+import 'dart:math';
+
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/entities.dart' show Nip65;
 import 'package:ndk/ndk.dart';
 import 'package:nip_append_only_list/nip_append_only_list.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 import 'package:test/test.dart';
 
 import 'mock_relay.dart';
@@ -12,6 +15,7 @@ void main() {
     late MockRelay relay;
     late Ndk ndk;
     late OfflineBroadcast outbox;
+    late SyncEngine syncEngine;
     late AppendOnlyLists lists;
     late EventSigner signer;
     late String pubkey;
@@ -35,10 +39,12 @@ void main() {
         relayListDiscoveryRelays: [relay.url],
       );
       outbox.start();
+      syncEngine = await _startedSyncEngine(ndk, 'sync.db');
 
       lists = AppendOnlyLists(
         ndk: ndk,
         outbox: outbox,
+        syncEngine: syncEngine,
         projection: ProjectionStore(projectionDb),
       );
 
@@ -51,6 +57,7 @@ void main() {
     tearDown(() async {
       await lists.dispose();
       await outbox.dispose();
+      await syncEngine.dispose();
       await ndk.destroy();
       await relay.stopServer();
     });
@@ -105,6 +112,7 @@ void main() {
       // Tear down everything except the relay.
       await lists.dispose();
       await outbox.dispose();
+      await syncEngine.dispose();
       await ndk.destroy();
 
       // Bring a brand-new stack up, pointing at the same relay.
@@ -117,9 +125,11 @@ void main() {
       );
       final outbox2 = OfflineBroadcast.withNdk(ndk2, db: outboxDb2);
       outbox2.start();
+      final syncEngine2 = await _startedSyncEngine(ndk2, 'sync2.db');
       final lists2 = AppendOnlyLists(
         ndk: ndk2,
         outbox: outbox2,
+        syncEngine: syncEngine2,
         projection: ProjectionStore(projDb2),
       );
 
@@ -135,6 +145,7 @@ void main() {
 
       await lists2.dispose();
       await outbox2.dispose();
+      await syncEngine2.dispose();
       await ndk2.destroy();
     });
 
@@ -314,6 +325,7 @@ void main() {
         final listsTiny = AppendOnlyLists(
           ndk: ndk,
           outbox: outbox,
+          syncEngine: syncEngine,
           projection: lists.projection,
           maxEventBytes: 350,
         );
@@ -391,6 +403,7 @@ void main() {
         // deterministic.
         await lists.dispose();
         await outbox.dispose();
+        await syncEngine.dispose();
         await ndk.destroy();
 
         // Device B: brand-new stack pointing at the same relay.
@@ -403,10 +416,21 @@ void main() {
         );
         final outbox2 = OfflineBroadcast.withNdk(ndk2, db: outboxDb2);
         outbox2.start();
+        final syncEngine2 = await _startedSyncEngine(ndk2, 'sync2.db');
         final lists2 = AppendOnlyLists(
           ndk: ndk2,
           outbox: outbox2,
+          syncEngine: syncEngine2,
           projection: ProjectionStore(projDb2),
+        );
+
+        // Consolidating in the same second as the add dates the fresh Add one
+        // second ahead (monotonic created_at), and the sync engine only reads
+        // up to now.
+        final newest = relay.receivedEvents.map((e) => e.createdAt).reduce(max);
+        await _waitUntil(
+          () => _now() > newest,
+          timeout: const Duration(seconds: 3),
         );
 
         // Sync from the relay (no local cache yet).
@@ -432,11 +456,13 @@ void main() {
 
         await lists2.dispose();
         await outbox2.dispose();
+        await syncEngine2.dispose();
         await ndk2.destroy();
 
         // Re-assign locals so tearDown's dispose calls are safe.
         ndk = ndk2;
         outbox = outbox2;
+        syncEngine = syncEngine2;
         lists = lists2;
       },
     );
@@ -448,6 +474,7 @@ void main() {
         // account.
         await lists.dispose();
         await outbox.dispose();
+        await syncEngine.dispose();
         await ndk.destroy();
 
         final ndk2 = _ndkForRelay(relay);
@@ -459,9 +486,11 @@ void main() {
         );
         final outbox2 = OfflineBroadcast.withNdk(ndk2, db: outboxDb2);
         outbox2.start();
+        final syncEngine2 = await _startedSyncEngine(ndk2, 'sync2.db');
         final lists2 = AppendOnlyLists(
           ndk: ndk2,
           outbox: outbox2,
+          syncEngine: syncEngine2,
           projection: ProjectionStore(projDb2),
         );
 
@@ -477,6 +506,7 @@ void main() {
         // Re-assign locals so tearDown's dispose calls are safe.
         ndk = ndk2;
         outbox = outbox2;
+        syncEngine = syncEngine2;
         lists = lists2;
       },
     );
@@ -563,8 +593,8 @@ void main() {
         final offline = await lists.getList(pubkey: pubkey, listName: 'fruits');
         expect(offline.entries, isEmpty);
 
-        // A forced refresh re-hydrates from the relay, proving the
-        // fetched-range bookmarks were cleared too.
+        // A forced refresh re-hydrates from the relay, proving the sync
+        // engine's coverage was forgotten too.
         final resynced = await lists.getList(
           pubkey: pubkey,
           listName: 'fruits',
@@ -601,7 +631,7 @@ void main() {
       final cache = await ndk.config.cache.loadEvents(kinds: appendOnlyKinds);
       expect(cache, isEmpty);
 
-      // Surgical fetched-range clearing hit the right fingerprints: a forced
+      // Surgical coverage forgetting hit the right fingerprints: a forced
       // refresh re-hydrates from the relay instead of assuming it's covered.
       final resynced = await lists.getList(
         pubkey: pubkey,
@@ -610,6 +640,94 @@ void main() {
         relays: [relay.url],
       );
       expect(resynced.entries.map((e) => e.value).toSet(), equals({'apple'}));
+    });
+
+    test(
+      'an edit delivered late with an old created_at is picked up',
+      () async {
+        await lists.getList(
+          pubkey: pubkey,
+          listName: 'fruits',
+          forceRefresh: true,
+          relays: [relay.url],
+        );
+
+        // Another device of the same author edited offline ten minutes ago and
+        // its outbox only delivers now, behind what this device already synced.
+        await _publishFromAnotherDevice(
+          relay,
+          await _signedAdd(signer, 'fruits', 'apple', createdAt: _now() - 600),
+        );
+
+        final state = await lists.getList(
+          pubkey: pubkey,
+          listName: 'fruits',
+          forceRefresh: true,
+          relays: [relay.url],
+        );
+        expect(state.entries.map((e) => e.value).toSet(), equals({'apple'}));
+      },
+    );
+
+    test('watchList folds in what the engine revisits bring', () async {
+      final fastEngine = SyncEngine(
+        ndk,
+        db: await newDatabaseFactoryMemory().openDatabase('fast-sync.db'),
+        maxStaleness: Duration.zero,
+        minRevisitPeriod: const Duration(milliseconds: 100),
+      )..start();
+      final watched = AppendOnlyLists(
+        ndk: ndk,
+        outbox: outbox,
+        syncEngine: fastEngine,
+        projection: lists.projection,
+      );
+
+      final emitted = <Set<String>>[];
+      final sub = watched
+          .watchList(pubkey: pubkey, listName: 'fruits', relays: [relay.url])
+          .listen((s) => emitted.add(s.entries.map((e) => e.value).toSet()));
+      await _waitUntil(() => emitted.isNotEmpty);
+
+      // Dated before the live subscription opened: only a sync pass brings it.
+      await _publishFromAnotherDevice(
+        relay,
+        await _signedAdd(signer, 'fruits', 'apple', createdAt: _now() - 600),
+      );
+      await _waitUntil(
+        () => emitted.last.contains('apple'),
+        timeout: const Duration(seconds: 3),
+      );
+
+      await sub.cancel();
+      await _waitUntil(() => fastEngine.engineStatus.activeRequests == 0);
+      await watched.dispose();
+      await fastEngine.dispose();
+    });
+
+    test('a relay refusing the sync leaves the list to fetch later', () async {
+      await _publishFromAnotherDevice(
+        relay,
+        await _signedAdd(signer, 'fruits', 'apple', createdAt: _now() - 60),
+      );
+
+      relay.closeRequestsMessage = 'rate-limited: slow down';
+      final refused = await lists.getList(
+        pubkey: pubkey,
+        listName: 'fruits',
+        forceRefresh: true,
+        relays: [relay.url],
+      );
+      expect(refused.entries, isEmpty);
+
+      relay.closeRequestsMessage = null;
+      final state = await lists.getList(
+        pubkey: pubkey,
+        listName: 'fruits',
+        forceRefresh: true,
+        relays: [relay.url],
+      );
+      expect(state.entries.map((e) => e.value).toSet(), equals({'apple'}));
     });
 
     test('queued broadcasts are attributed to the author pubkey', () async {
@@ -641,6 +759,40 @@ Ndk _ndkForRelay(MockRelay relay) {
       bootstrapRelays: [relay.url],
     ),
   );
+}
+
+Future<SyncEngine> _startedSyncEngine(Ndk ndk, String dbName) async {
+  final db = await newDatabaseFactoryMemory().openDatabase(dbName);
+  return SyncEngine(ndk, db: db)..start();
+}
+
+int _now() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+Future<Nip01Event> _signedAdd(
+  EventSigner signer,
+  String listName,
+  String value, {
+  required int createdAt,
+}) async => signer.sign(
+  await buildAppendOnlyEvent(
+    op: AppendOnlyListOp.add,
+    listName: listName,
+    entries: [AppendOnlyListEntry(tag: 't', value: value)],
+    pubkey: signer.getPublicKey(),
+    signer: signer,
+    createdAt: createdAt,
+  ),
+);
+
+Future<void> _publishFromAnotherDevice(
+  MockRelay relay,
+  Nip01Event event,
+) async {
+  final other = _ndkForRelay(relay);
+  await other.broadcast
+      .broadcast(nostrEvent: event, specificRelays: [relay.url])
+      .broadcastDoneFuture;
+  await other.destroy();
 }
 
 /// Polls until [check] returns true or [timeout] elapses.

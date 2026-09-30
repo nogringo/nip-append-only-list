@@ -8,6 +8,24 @@
   resolves later, offline included. An author without NIP-65 ends up with a
   `failed` entry in the queue. The outbox needs a `relayListFn`, which
   `OfflineBroadcast.withNdk` provides.
+- **Breaking:** `AppendOnlyLists` takes a caller-owned, started `SyncEngine`
+  from `sync_engine_shim_for_ndk ^0.7.1` (`syncEngine:`), which replaces the
+  sync built on NDK's experimental `fetchedRanges`. Requires Dart `^3.12.2`.
+  The NDK cache must be persistent and cleared together with the engine.
+- Fix: an edit reaching the relays after this device already synced past its
+  `created_at` (another device editing offline, then its outbox delivering
+  late) was never fetched, even by `forceRefresh`. Each pass now reaches
+  `overlapMargin` (new, default 7 days) further back.
+- Fix: a relay that timed out or answered `CLOSED` had its range recorded as
+  covered, so what it held was never fetched again. Only an `EOSE` counts now.
+- `watchList` holds the list on the engine while listened to, so the list is
+  backfilled and then revisited on its own. The live subscription still
+  carries new events as they are published.
+- `getList` waits up to `timeout` for the whole pass rather than per query,
+  and a background read no longer goes to the relays when the engine's
+  coverage is fresh.
+- Sync requests go out anonymously: a relay that serves reads only after
+  NIP-42 AUTH is no longer read.
 
 ## 0.2.0
 

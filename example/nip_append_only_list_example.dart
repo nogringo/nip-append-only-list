@@ -2,6 +2,7 @@ import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nip_append_only_list/nip_append_only_list.dart';
 import 'package:sembast/sembast_memory.dart';
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 /// Minimal end-to-end wiring of [AppendOnlyLists].
 ///
@@ -14,9 +15,10 @@ Future<void> main() async {
     NdkConfig(eventVerifier: Bip340EventVerifier(), cache: MemCacheManager()),
   );
 
-  // 2. Persistent (here: in-memory) sembast DBs for the outbox and our
-  //    cleartext projection. The caller owns both lifecycles.
+  // 2. Persistent (here: in-memory) sembast DBs for the outbox, the sync
+  //    engine and our cleartext projection. The caller owns their lifecycles.
   final outboxDb = await newDatabaseFactoryMemory().openDatabase('outbox.db');
+  final syncDb = await newDatabaseFactoryMemory().openDatabase('sync.db');
   final projectionDb = await newDatabaseFactoryMemory().openDatabase(
     'projection.db',
   );
@@ -25,17 +27,22 @@ Future<void> main() async {
   final outbox = OfflineBroadcast.withNdk(ndk, db: outboxDb);
   outbox.start();
 
-  // 4. Cleartext projection store.
+  // 4. Sync engine: keeps the NDK cache in sync with the relays.
+  final syncEngine = SyncEngine(ndk, db: syncDb);
+  syncEngine.start();
+
+  // 5. Cleartext projection store.
   final projection = ProjectionStore(projectionDb);
 
-  // 5. The usecase.
+  // 6. The usecase.
   final lists = AppendOnlyLists(
     ndk: ndk,
     outbox: outbox,
+    syncEngine: syncEngine,
     projection: projection,
   );
 
-  // 6. Generate a fresh keypair and log it into NDK. Once logged in,
+  // 7. Generate a fresh keypair and log it into NDK. Once logged in,
   //    write methods pick up the signer automatically.
   final signer = const Bip340EventSignerFactory().createWithNewKeyPair();
   ndk.accounts.loginExternalSigner(signer: signer);
@@ -66,5 +73,6 @@ Future<void> main() async {
 
   await lists.dispose();
   await outbox.dispose();
+  await syncEngine.dispose();
   await ndk.destroy();
 }

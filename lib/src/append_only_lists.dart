@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart' hide RelaySet;
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 import 'entry.dart';
 import 'event_codec.dart';
@@ -18,6 +19,9 @@ import 'state.dart';
 ///   * [outbox] - `broadcast_queue_shim_for_ndk` queue for durable delivery.
 ///     Build it with `OfflineBroadcast.withNdk` (or give it a `relayListFn`)
 ///     so writes without `relays:` can look up the author's NIP-65.
+///   * [syncEngine] - `sync_engine_shim_for_ndk` engine filling the NDK cache
+///     from the relays. Its coverage must live exactly as long as the NDK
+///     cache: clear both or neither.
 ///   * [projection] - sembast-backed cleartext store, mirrored from the
 ///     events for offline reads (incl. previously-decrypted private entries).
 ///
@@ -28,14 +32,20 @@ class AppendOnlyLists {
   AppendOnlyLists({
     required Ndk ndk,
     required this.outbox,
+    required this.syncEngine,
     required this.projection,
     this.maxEventBytes = 32 * 1024,
+    this.overlapMargin = const Duration(days: 7),
   }) : _ndk = ndk,
        _cache = ndk.config.cache;
 
   /// Durable outgoing-event queue. Public so callers can inspect pending
   /// broadcasts, trigger manual retries, etc.
   final OfflineBroadcast outbox;
+
+  /// Downward sync engine. Caller-owned like [outbox]: it has to be started,
+  /// and may be shared with other features.
+  final SyncEngine syncEngine;
 
   /// Cleartext projection of computed list state. Public so callers can
   /// read or evict entries directly (useful for tests and for app-level
@@ -49,6 +59,11 @@ class AppendOnlyLists {
   /// portable). The estimator is approximate, so a small safety margin
   /// is already baked in.
   final int maxEventBytes;
+
+  /// How far back each sync pass reaches beyond what is already covered. An
+  /// edit reaching the relays later than this after its `created_at`, from a
+  /// device that stayed offline longer, is not picked up.
+  final Duration overlapMargin;
 
   final Ndk _ndk;
   final CacheManager _cache;
@@ -135,8 +150,12 @@ class AppendOnlyLists {
   // ---------------------------------------------------------------- Reading
 
   /// Returns the current list state from the projection plus the raw event
-  /// cache. Falls back to a remote query when the local view is empty or
-  /// [forceRefresh] is set.
+  /// cache, and asks [syncEngine] to bring the list up to date.
+  ///
+  /// When the local view is empty or [forceRefresh] is set, waits up to
+  /// [timeout] for that sync pass, a forced one going to the relays whatever
+  /// the engine's staleness. Otherwise the pass runs in the background and
+  /// [watchList] observers see what it brings.
   ///
   /// [signer] is optional; if provided, encrypted content is decrypted and
   /// merged into the projection on the fly.
@@ -159,37 +178,33 @@ class AppendOnlyLists {
         signer: signer,
       );
     }
+    if (resolvedRelays.isEmpty) return state;
 
-    if (forceRefresh || state.stats.isEmpty) {
-      state = await _syncFromRelays(
-        pubkey: pubkey,
-        listName: listName,
-        signer: signer,
-        timeout: timeout,
-        explicitRelays: resolvedRelays,
-      );
-    } else {
-      // Best-effort incremental sync in the background; don't block the
-      // caller. Errors are swallowed - relay unreachability is expected.
-      unawaited(
-        _syncFromRelays(
-          pubkey: pubkey,
-          listName: listName,
-          signer: signer,
-          timeout: timeout,
-          explicitRelays: resolvedRelays,
-        ).then((_) {}, onError: (_) {}),
-      );
+    final synced = _syncOnce(
+      pubkey: pubkey,
+      listName: listName,
+      signer: signer,
+      relays: resolvedRelays,
+      force: forceRefresh,
+    );
+    if (!forceRefresh && state.stats.isNotEmpty) {
+      // Relay unreachability is expected, the local view stands.
+      synced.ignore();
+      return state;
     }
-
-    return state;
+    try {
+      return await synced.timeout(timeout);
+    } on TimeoutException {
+      return projection.load(pubkey: pubkey, listName: listName);
+    }
   }
 
   /// Streams state updates as new events arrive.
   ///
   /// The stream emits an initial snapshot immediately, then re-emits on
-  /// every relevant Add/Remove (local or remote). Cancel the subscription
-  /// to stop the underlying NDK subscription.
+  /// every relevant Add/Remove (local or remote). While it is listened to,
+  /// the list's sync request is held on [syncEngine], which backfills it and
+  /// revisits it on its own. Cancel the subscription to release it.
   Stream<AppendOnlyListState> watchList({
     required String pubkey,
     required String listName,
@@ -207,6 +222,8 @@ class AppendOnlyLists {
 
     late final StreamController<AppendOnlyListState> controller;
     NdkResponse? sub;
+    SyncHandle? handle;
+    StreamSubscription<SyncRequestStatus>? passes;
 
     controller = StreamController<AppendOnlyListState>.broadcast(
       onListen: () async {
@@ -219,24 +236,20 @@ class AppendOnlyLists {
         );
         // 2. Resolve relays (explicit > NIP-65 > skip network).
         final resolvedRelays = await _resolveRelaysOrEmpty(relays, pubkey);
-        if (resolvedRelays.isEmpty) return;
-        // 3. Paginated backfill - fills any historical gap the relay would
-        //    otherwise truncate. `_syncFromRelays` uses `paginate: true`
-        //    and `fetchedRanges` to avoid redundant work.
-        try {
-          await _syncFromRelays(
-            pubkey: pubkey,
-            listName: listName,
-            signer: signer,
-            timeout: const Duration(seconds: 10),
-            explicitRelays: resolvedRelays,
-          );
-        } catch (_) {
-          // Don't tear the stream down on transient relay errors.
-        }
-        // 4. Open a live subscription for new events arriving *after* now.
-        //    A subscription doesn't paginate; pagination is handled by the
-        //    backfill above, and the subscription only carries the tail.
+        if (resolvedRelays.isEmpty || !controller.hasListener) return;
+        // 3. Hold the sync request for as long as the list is watched.
+        final held = syncEngine.ensure(
+          _syncRequest(pubkey, listName, resolvedRelays),
+        );
+        handle = held;
+        passes = _foldEachPass(
+          held,
+          pubkey: pubkey,
+          listName: listName,
+          signer: signer,
+        );
+        // 4. The engine polls, so a live subscription carries what gets
+        //    published from now on.
         final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
         sub = _ndk.requests.subscription(
           filter: listFilter(pubkey: pubkey, listName: listName, since: now),
@@ -253,6 +266,9 @@ class AppendOnlyLists {
         }, onError: (_) {});
       },
       onCancel: () async {
+        await passes?.cancel();
+        final held = handle;
+        if (held != null) syncEngine.release(held);
         if (sub != null) {
           await _ndk.requests.closeSubscription(sub!.requestId);
         }
@@ -261,6 +277,71 @@ class AppendOnlyLists {
     );
     _controllers[key] = controller;
     return controller.stream;
+  }
+
+  SyncRequest _syncRequest(
+    String pubkey,
+    String listName,
+    List<String> relays,
+  ) => SyncRequest(
+    filters: [
+      listFilter(pubkey: pubkey, listName: listName),
+      deletionFilter(pubkey: pubkey),
+    ],
+    relays: relays,
+    overlapMargin: overlapMargin,
+  );
+
+  /// Holds the list's sync request for one pass, then folds what it landed.
+  Future<AppendOnlyListState> _syncOnce({
+    required String pubkey,
+    required String listName,
+    required EventSigner? signer,
+    required List<String> relays,
+    required bool force,
+  }) async {
+    final handle = syncEngine.ensure(_syncRequest(pubkey, listName, relays));
+    try {
+      if (force) {
+        await syncEngine.refresh(handle);
+      } else {
+        // A pass started by ensure() already reports syncing.
+        await syncEngine
+            .watchStatus(handle)
+            .any((status) => status.phase != SyncRequestPhase.syncing);
+      }
+    } finally {
+      syncEngine.release(handle);
+    }
+    return _foldSynced(pubkey: pubkey, listName: listName, signer: signer);
+  }
+
+  /// Folds the cache into the projection after each pass of [handle] that
+  /// landed events, so a watched list follows the engine's revisits.
+  StreamSubscription<SyncRequestStatus> _foldEachPass(
+    SyncHandle handle, {
+    required String pubkey,
+    required String listName,
+    EventSigner? signer,
+  }) {
+    // The status replays the last page on listen, which is no news.
+    var lastPage = syncEngine.status(handle).progress;
+    var landed = false;
+    return syncEngine.watchStatus(handle).listen((status) {
+      final page = status.progress;
+      if (page != null && !identical(page, lastPage)) {
+        lastPage = page;
+        if (page.eventCount > 0) landed = true;
+      }
+      if (landed && status.phase != SyncRequestPhase.syncing) {
+        landed = false;
+        _foldSynced(
+          pubkey: pubkey,
+          listName: listName,
+          signer: signer,
+        ).ignore();
+      }
+    });
   }
 
   // ---------------------------------------------------------------- Writing
@@ -548,8 +629,8 @@ class AppendOnlyLists {
 
   // ----------------------------------------------------------------- Closes
 
-  /// Closes every active `watchList` stream. The injected [outbox] and
-  /// [ndk] remain owned by the caller and are not disposed.
+  /// Closes every active `watchList` stream. The injected [outbox],
+  /// [syncEngine] and [ndk] remain owned by the caller and are not disposed.
   Future<void> dispose() async {
     for (final c in _controllers.values) {
       await c.close();
@@ -565,8 +646,8 @@ class AppendOnlyLists {
   ///   * the sembast projection (state, tombstones, cached plaintext);
   ///   * the raw 1990/1991 events and the author's list-related kind 5
   ///     deletions in the NDK cache;
-  ///   * the NDK fetched-range bookmarks for those lists, so the next read
-  ///     re-fetches from relays instead of assuming the ranges are covered.
+  ///   * the [syncEngine] coverage of those lists, so the next read re-fetches
+  ///     from relays instead of assuming the ranges are covered.
   ///
   /// Active [watchList] streams for [pubkey] are closed. The injected outbox
   /// is caller-owned and may be shared with other features, and its clear is
@@ -599,30 +680,28 @@ class AppendOnlyLists {
       },
     );
 
-    // ignore: experimental_member_use
-    await _ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+    await syncEngine.forgetFilter(deletionFilter(pubkey: pubkey));
     for (final listName in listNames) {
-      // ignore: experimental_member_use
-      await _ndk.fetchedRanges.clearForFilter(
+      await syncEngine.forgetFilter(
         listFilter(pubkey: pubkey, listName: listName),
       );
     }
   }
 
   /// Erases all local append-only-list data on this device, every account
-  /// included: the entire projection store, plus every 1990/1991 event, the
-  /// matching kind 5 deletions and the fetched-range bookmarks in the NDK
-  /// cache. Every active [watchList] stream is closed.
+  /// included: the entire projection store, every 1990/1991 event and the
+  /// matching kind 5 deletions in the NDK cache, and the [syncEngine]
+  /// coverage of those lists. Every active [watchList] stream is closed.
   ///
   /// Stays within the package's scope: unrelated NDK cache data (metadata,
-  /// contacts, other kinds) and fetched-range bookmarks for other filters are
+  /// contacts, other kinds) and the engine's coverage of other filters are
   /// left in place. The caller-owned outbox is untouched too (see
   /// [clearLocalAccountData]); nothing is published.
   ///
-  /// Fetched-range bookmarks are cleared per known filter, reconstructed from
-  /// the cached events before they are wiped. A bookmark for a list with no
-  /// remaining cached events is left behind - harmless, since nothing
-  /// references it anymore.
+  /// Coverage is forgotten per known filter, reconstructed from the cached
+  /// events before they are wiped. The coverage of a list with no remaining
+  /// cached events is left behind - harmless, since nothing references it
+  /// anymore.
   Future<void> clearAllLocalData() async {
     for (final c in _controllers.values) {
       await c.close();
@@ -649,12 +728,10 @@ class AppendOnlyLists {
     );
 
     for (final pubkey in pubkeys) {
-      // ignore: experimental_member_use
-      await _ndk.fetchedRanges.clearForFilter(deletionFilter(pubkey: pubkey));
+      await syncEngine.forgetFilter(deletionFilter(pubkey: pubkey));
     }
     for (final (pubkey, listName) in listPairs) {
-      // ignore: experimental_member_use
-      await _ndk.fetchedRanges.clearForFilter(
+      await syncEngine.forgetFilter(
         listFilter(pubkey: pubkey, listName: listName),
       );
     }
@@ -720,6 +797,56 @@ class AppendOnlyLists {
     required String listName,
     EventSigner? signer,
   }) async {
+    final state = AppendOnlyListState.foldEvents(
+      await _parseCache(pubkey: pubkey, listName: listName, signer: signer),
+      pubkey: pubkey,
+      listName: listName,
+    );
+    await projection.save(state);
+    return state;
+  }
+
+  /// Folds the cached events into the stored state rather than rebuilding it,
+  /// so a local write landing meanwhile is never overwritten. Folding is
+  /// idempotent, so events already in the projection change nothing.
+  Future<AppendOnlyListState> _mergeCache({
+    required String pubkey,
+    required String listName,
+    EventSigner? signer,
+  }) async {
+    final events = await _parseCache(
+      pubkey: pubkey,
+      listName: listName,
+      signer: signer,
+    );
+    return projection.update(
+      pubkey: pubkey,
+      listName: listName,
+      mutator: (current) => events.fold(current, _foldOne),
+    );
+  }
+
+  /// Brings the projection up to date with what [syncEngine] landed in the
+  /// cache, and pushes the result to [watchList] observers.
+  Future<AppendOnlyListState> _foldSynced({
+    required String pubkey,
+    required String listName,
+    EventSigner? signer,
+  }) async {
+    final state = await _applyDeletions(pubkey: pubkey, listName: listName)
+        ? await _replayCache(pubkey: pubkey, listName: listName, signer: signer)
+        : await _mergeCache(pubkey: pubkey, listName: listName, signer: signer);
+    _publish(state);
+    return state;
+  }
+
+  /// Parses every cached, non-tombstoned event of the list, with its
+  /// plaintext when it is already known or [signer] can decrypt it.
+  Future<List<AppendOnlyListEvent>> _parseCache({
+    required String pubkey,
+    required String listName,
+    EventSigner? signer,
+  }) async {
     final events = await _cache.loadEvents(
       pubKeys: [pubkey],
       kinds: appendOnlyKinds,
@@ -781,217 +908,57 @@ class AppendOnlyLists {
       );
     }
 
-    final state = AppendOnlyListState.fromEvents(
-      filtered,
-      pubkey: pubkey,
-      listName: listName,
-      plaintextById: plaintextById,
-    );
-    await projection.save(state);
-    return state;
+    return [
+      for (final event in filtered)
+        ?AppendOnlyListEvent.parse(event, plaintext: plaintextById[event.id]),
+    ];
   }
 
-  /// Remote sync with per-relay gap detection.
+  /// Tombstones the append-only events [pubkey] deleted with NIP-09, from the
+  /// kind 5 events [syncEngine] landed in the cache, and drops them from the
+  /// cache along with their plaintext.
   ///
-  /// Uses `ndk.fetchedRanges` to compute the time gaps each relay still
-  /// owes us and issues one query per gap. After a successful query, the
-  /// covered range is recorded so subsequent syncs skip work that has
-  /// already been done - even across restarts (provided the configured
-  /// `CacheManager` persists fetched-range records, as `SembastCacheManager`
-  /// does).
+  /// Every referenced id is tombstoned, whether or not its event reached this
+  /// device yet, so a relay redelivering it later cannot bring it back. The
+  /// deletions carry no `d` tag, so ids of the author's other lists land here
+  /// too: harmless, those events never pass the `d` check of this list.
   ///
-  /// When [explicitRelays] is null or empty, the function returns
-  /// immediately without touching the network - the caller is expected to
-  /// have either passed a relay list explicitly or resolved one via NIP-65
-  /// upstream. Reads silently degrade to "projection only" in this case.
-  Future<AppendOnlyListState> _syncFromRelays({
+  /// Returns `true` when a deletion is new to this list, which means the
+  /// projection may still count the deleted events and has to be rebuilt.
+  Future<bool> _applyDeletions({
     required String pubkey,
     required String listName,
-    EventSigner? signer,
-    required Duration timeout,
-    Iterable<String>? explicitRelays,
   }) async {
-    if (explicitRelays == null || explicitRelays.isEmpty) {
-      return projection.load(pubkey: pubkey, listName: listName);
-    }
-    // Honor NIP-09 deletions first. If any apply, the affected raw events
-    // are dropped from the NDK cache and the projection is rebuilt from
-    // scratch, so the rest of the sync runs against a clean state.
-    final hadDeletions = await _syncDeletions(
+    final deletions = await _cache.loadEvents(
+      pubKeys: [pubkey],
+      kinds: const [5],
+      tags: {
+        'k': [for (final k in appendOnlyKinds) '$k'],
+      },
+    );
+    final targets = {
+      for (final deletion in deletions) ...deletion.getTags('e'),
+    };
+    final known = await projection.loadTombstones(
       pubkey: pubkey,
       listName: listName,
-      timeout: timeout,
-      explicitRelays: explicitRelays,
     );
-    if (hadDeletions) {
-      await _replayCache(pubkey: pubkey, listName: listName, signer: signer);
-    }
-    final baseFilter = listFilter(pubkey: pubkey, listName: listName);
-    final until = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final fresh = targets.difference(known);
+    if (fresh.isEmpty) return false;
 
-    // ignore: experimental_member_use
-    final perRelay = await _ndk.fetchedRanges.getOptimizedFilters(
-      filter: baseFilter,
-      since: 0,
-      until: until,
-      relayUrls: explicitRelays.toList(growable: false),
-    );
-
-    for (final entry in perRelay.entries) {
-      final relayUrl = entry.key;
-      for (final gapFilter in entry.value) {
-        // Drop the gap's `until` before querying the relay. Reason: local
-        // writes can use a `created_at` slightly in the future of the
-        // current wall clock (the monotonic bump in `_emit` makes sequential
-        // ops in the same second strictly orderable). A strict `until: now`
-        // on the filter would let the relay drop those events on the floor.
-        // We still record [since, wall_now] as covered in `fetchedRanges`,
-        // so anything past wall_now is just re-fetched at the next sync.
-        final queryFilter = gapFilter.clone()..until = null;
-        final response = _ndk.requests.query(
-          filter: queryFilter,
-          timeout: timeout,
-          explicitRelays: [relayUrl],
-          // Paginate within each gap so we are not silently truncated by
-          // the relay's per-filter cap.
-          paginate: true,
-        );
-        var ok = true;
-        try {
-          await for (final event in response.stream) {
-            await _ingestRemoteEvent(
-              event,
-              pubkey: pubkey,
-              listName: listName,
-              signer: signer,
-            );
-          }
-        } catch (_) {
-          ok = false;
-        }
-        if (ok) {
-          // ignore: experimental_member_use
-          await _ndk.fetchedRanges.addRange(
-            filter: baseFilter,
-            relayUrl: relayUrl,
-            since: gapFilter.since ?? 0,
-            until: gapFilter.until ?? until,
-          );
-        }
-      }
-    }
-
-    return projection.load(pubkey: pubkey, listName: listName);
-  }
-
-  /// Pulls NIP-09 deletion events (kind 5 with `#k:["1990","1991"]`) for
-  /// [pubkey], intersects them with cached 1990/1991 events belonging to
-  /// [listName], persists the affected ids as tombstones and removes the
-  /// events from the NDK cache.
-  ///
-  /// Returns `true` if at least one cached event was tombstoned, which
-  /// signals the caller to re-fold the projection from the trimmed cache.
-  Future<bool> _syncDeletions({
-    required String pubkey,
-    required String listName,
-    required Duration timeout,
-    required Iterable<String> explicitRelays,
-  }) async {
-    final base = deletionFilter(pubkey: pubkey);
-    final until = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-
-    // ignore: experimental_member_use
-    final perRelay = await _ndk.fetchedRanges.getOptimizedFilters(
-      filter: base,
-      since: 0,
-      until: until,
-      relayUrls: explicitRelays.toList(growable: false),
-    );
-
-    final deletions = <Nip01Event>[];
-    for (final entry in perRelay.entries) {
-      final relayUrl = entry.key;
-      for (final gapFilter in entry.value) {
-        // Same `until = null` trick as `_syncFromRelays`: don't let the
-        // relay drop future-dated events on the floor.
-        final queryFilter = gapFilter.clone()..until = null;
-        final response = _ndk.requests.query(
-          filter: queryFilter,
-          timeout: timeout,
-          explicitRelays: [relayUrl],
-          paginate: true,
-        );
-        var ok = true;
-        try {
-          await for (final event in response.stream) {
-            if (event.kind == 5 && event.pubKey == pubkey) {
-              deletions.add(event);
-            }
-          }
-        } catch (_) {
-          ok = false;
-        }
-        if (ok) {
-          // ignore: experimental_member_use
-          await _ndk.fetchedRanges.addRange(
-            filter: base,
-            relayUrl: relayUrl,
-            since: gapFilter.since ?? 0,
-            until: gapFilter.until ?? until,
-          );
-        }
-      }
-    }
-
-    if (deletions.isEmpty) return false;
-
-    // Collect every targeted event id from every deletion. The `#k`
-    // filter already restricted us to deletions whose `k` tag is 1990 or
-    // 1991, so every collected id is, by author's own claim, a deletion
-    // of an append-only event.
-    final targets = <String>{};
-    for (final del in deletions) {
-      for (final tag in del.tags) {
-        if (tag.length >= 2 && tag[0] == 'e') targets.add(tag[1]);
-      }
-    }
-    if (targets.isEmpty) return false;
-
-    // Persist every referenced id as a tombstone, *without* intersecting
-    // with the local cache. Two reasons:
-    //   1. A fresh device may receive the deletion before the deleted
-    //      events themselves; tombstoning unconditionally lets us drop
-    //      the revenants at ingestion (see `_ingestRemoteEvent`).
-    //   2. The deletion query uses `fetchedRanges`, so we only see each
-    //      deletion once - we can't rely on "retry next sync".
-    // Ids targeting other lists of the same author are harmless dead
-    // weight: those events would have been dropped by the d-tag check
-    // in `_ingestRemoteEvent` anyway.
     await projection.addTombstones(
       pubkey: pubkey,
       listName: listName,
-      ids: targets,
+      ids: fresh,
     );
-
-    // Cache cleanup: only events we actually have, narrowed to our list.
-    final cached = await _cache.loadEvents(
+    final ids = fresh.toList(growable: false);
+    await _cache.removeEvents(
+      ids: ids,
       pubKeys: [pubkey],
       kinds: appendOnlyKinds,
-      ids: targets.toList(growable: false),
     );
-    final toRemove = cached
-        .where((e) => e.getDtag() == listName)
-        .map((e) => e.id)
-        .toList(growable: false);
-    for (final id in toRemove) {
-      await _cache.removeEvent(id);
-    }
-    // The raw events are gone - drop their cached plaintext too. Keeping
-    // them would just be dead cleartext on disk.
-    await projection.deleteDecryptedPlaintext(toRemove);
-    // Re-fold only needed when something was actually evicted from the
-    // cache - otherwise the projection didn't see those events anyway.
-    return toRemove.isNotEmpty;
+    await projection.deleteDecryptedPlaintext(ids);
+    return true;
   }
 
   Future<void> _ingestRemoteEvent(
@@ -1023,10 +990,12 @@ class AppendOnlyLists {
       listName: event.listName,
       mutator: (current) => _foldOne(current, event),
     );
-    final controller = _controllers[_key(event.pubkey, event.listName)];
-    if (controller != null && !controller.isClosed) {
-      controller.add(next);
-    }
+    _publish(next);
+  }
+
+  void _publish(AppendOnlyListState state) {
+    final controller = _controllers[_key(state.pubkey, state.listName)];
+    if (controller != null && !controller.isClosed) controller.add(state);
   }
 
   AppendOnlyListState _foldOne(

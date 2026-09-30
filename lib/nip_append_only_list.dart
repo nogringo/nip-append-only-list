@@ -15,9 +15,10 @@
 /// * A persistent cleartext projection store ([ProjectionStore]) backed by
 ///   sembast - keeps previously-decrypted private entries readable across
 ///   restarts even before a signer is connected.
-/// * [AppendOnlyLists], a high-level usecase wiring NDK's cache + requests,
-///   the projection, and an injected `OfflineBroadcast` queue for durable
-///   write delivery.
+/// * [AppendOnlyLists], a high-level usecase wiring NDK's cache, the
+///   projection, an injected `SyncEngine` that keeps the cache in sync with
+///   the relays, and an injected `OfflineBroadcast` queue for durable write
+///   delivery.
 library;
 
 export 'src/append_only_lists.dart';

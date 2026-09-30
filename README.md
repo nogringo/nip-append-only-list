@@ -2,8 +2,9 @@
 
 Local-first Dart implementation of the **Nostr append-only lists NIP**
 (kinds `1990` Add / `1991` Remove). Built on top of
-[`ndk`](https://pub.dev/packages/ndk) and
-[`broadcast_queue_shim_for_ndk`](https://pub.dev/packages/broadcast_queue_shim_for_ndk),
+[`ndk`](https://pub.dev/packages/ndk),
+[`broadcast_queue_shim_for_ndk`](https://pub.dev/packages/broadcast_queue_shim_for_ndk)
+and [`sync_engine_shim_for_ndk`](https://pub.dev/packages/sync_engine_shim_for_ndk),
 with a sembast-backed cleartext projection so previously-decrypted private
 entries remain readable across restarts even before a signer reconnects.
 
@@ -25,16 +26,23 @@ coordination.
 
 ## Local-first design
 
-Three persistence layers are wired by the caller:
+Four persistence layers are wired by the caller:
 
 1. **NDK `CacheManager`** - raw 1990/1991 events as received from relays
-   (encrypted content preserved). Used for incremental sync (`since:
-   <last_known_created_at>`).
-2. **Cleartext projection** (this package's `ProjectionStore`, sembast) -
+   (encrypted content preserved). It must be persistent (e.g.
+   `SembastCacheManager`).
+2. **`SyncEngine`** (from `sync_engine_shim_for_ndk`) - fills the NDK cache
+   from the relays and remembers, per relay, what it already covered. Each
+   pass reaches `overlapMargin` (default 7 days) further back, so an edit
+   made offline on another device and delivered late is still picked up. A
+   relay that times out or refuses the request is not marked as covered.
+   Its coverage must live exactly as long as the NDK cache: clear both or
+   neither.
+3. **Cleartext projection** (this package's `ProjectionStore`, sembast) -
    per `(author, listName)` OR-Set bookkeeping in cleartext. Once a private
    entry has been decrypted with a signer, it stays readable at every
    subsequent boot, with or without the signer.
-3. **`OfflineBroadcast`** (from
+4. **`OfflineBroadcast`** (from
    `broadcast_queue_shim_for_ndk`) - durable outgoing queue. Writes return
    as soon as the event is persisted; delivery survives restarts and
    retries until every targeted relay acks.
@@ -50,6 +58,7 @@ dependencies:
   nip_append_only_list: ^0.3.0
   ndk: ^0.10.0
   broadcast_queue_shim_for_ndk: ^0.6.0
+  sync_engine_shim_for_ndk: ^0.7.1
   sembast: ^3.8.7
 ```
 
@@ -60,6 +69,7 @@ import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
 import 'package:ndk/ndk.dart';
 import 'package:nip_append_only_list/nip_append_only_list.dart';
 import 'package:sembast/sembast_io.dart'; // or sembast_web on web
+import 'package:sync_engine_shim_for_ndk/sync_engine_shim_for_ndk.dart';
 
 final ndk = Ndk(NdkConfig(
   eventVerifier: Bip340EventVerifier(),
@@ -67,14 +77,19 @@ final ndk = Ndk(NdkConfig(
 ));
 
 final outboxDb = await databaseFactoryIo.openDatabase('outbox.db');
+final syncDb = await databaseFactoryIo.openDatabase('sync.db');
 final projectionDb = await databaseFactoryIo.openDatabase('projection.db');
 
 final outbox = OfflineBroadcast.withNdk(ndk, db: outboxDb);
 outbox.start();
 
+final syncEngine = SyncEngine(ndk, db: syncDb);
+syncEngine.start();
+
 final lists = AppendOnlyLists(
   ndk: ndk,
   outbox: outbox,
+  syncEngine: syncEngine,
   projection: ProjectionStore(projectionDb),
   // Optional: cap the size of consolidation events so relays don't
   // reject huge fresh-Adds or deletion bundles. Default 32 KB.
@@ -112,7 +127,8 @@ final state = await lists.getList(
 );
 print(state.entries); // {apple, cherry (private)}
 
-// Reactive view (initial snapshot + live updates).
+// Reactive view (initial snapshot + live updates). While listened to, the
+// list stays registered on the sync engine, which revisits it on its own.
 final sub = lists.watchList(
   pubkey: myPubkey,
   listName: 'fruits',
