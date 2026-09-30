@@ -47,9 +47,9 @@ Three persistence layers are wired by the caller:
 
 ```yaml
 dependencies:
-  nip_append_only_list: ^0.1.0
-  ndk: ^0.8.4-dev.1
-  broadcast_queue_shim_for_ndk: ^0.2.0
+  nip_append_only_list: ^0.3.0
+  ndk: ^0.10.0
+  broadcast_queue_shim_for_ndk: ^0.6.0
   sembast: ^3.8.7
 ```
 
@@ -88,8 +88,8 @@ final lists = AppendOnlyLists(
 ndk.accounts.loginPrivateKey(pubkey: myPubkey, privkey: myPrivkey);
 
 // Add three entries to a list named "fruits".
-// `relays` is optional; when omitted, the author's NIP-65 write relays
-// are resolved automatically via NDK.
+// `relays` is optional; when omitted, the outbox looks up the author's
+// NIP-65 write relays, offline included.
 await lists.add(
   listName: 'fruits',
   entries: const [

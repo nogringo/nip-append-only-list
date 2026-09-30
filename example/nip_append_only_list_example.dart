@@ -40,8 +40,8 @@ Future<void> main() async {
   final signer = const Bip340EventSignerFactory().createWithNewKeyPair();
   ndk.accounts.loginExternalSigner(signer: signer);
 
-  // Add three fruits. `relays` is omitted: NIP-65 write relays for the
-  // signer are resolved via NDK. Pass `relays:` explicitly to override.
+  // Add three fruits. `relays` is omitted: the outbox looks up the signer's
+  // NIP-65 write relays. Pass `relays:` explicitly to override.
   await lists.add(
     listName: 'fruits',
     entries: const [

@@ -1,3 +1,14 @@
+## 0.3.0
+
+- **Breaking:** require `ndk ^0.10.0` and `broadcast_queue_shim_for_ndk
+  ^0.6.0`.
+- **Breaking:** `add`, `remove` and `consolidate` called without `relays:` no
+  longer throw when the author's NIP-65 is unknown. The event is applied
+  locally and queued for `RelaySet.outbox(pubkey)`, which the outbox worker
+  resolves later, offline included. An author without NIP-65 ends up with a
+  `failed` entry in the queue. The outbox needs a `relayListFn`, which
+  `OfflineBroadcast.withNdk` provides.
+
 ## 0.2.0
 
 - Add `AppendOnlyLists.clearLocalAccountData({pubkey})` and

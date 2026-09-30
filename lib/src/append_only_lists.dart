@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/ndk.dart';
+import 'package:ndk/ndk.dart' hide RelaySet;
 
 import 'entry.dart';
 import 'event_codec.dart';
@@ -16,6 +16,8 @@ import 'state.dart';
 /// Persistence wiring is owned by the caller:
 ///   * [ndk] - NDK instance whose `CacheManager` keeps raw events.
 ///   * [outbox] - `broadcast_queue_shim_for_ndk` queue for durable delivery.
+///     Build it with `OfflineBroadcast.withNdk` (or give it a `relayListFn`)
+///     so writes without `relays:` can look up the author's NIP-65.
 ///   * [projection] - sembast-backed cleartext store, mirrored from the
 ///     events for offline reads (incl. previously-decrypted private entries).
 ///
@@ -75,22 +77,12 @@ class AppendOnlyLists {
     return s;
   }
 
-  /// Returns [explicit] if non-empty, otherwise resolves the author's NIP-65
-  /// write relays via NDK. Throws when neither is available - the outbox
-  /// shim requires a non-empty target list per event.
-  Future<List<String>> _resolveRelays(
-    List<String>? explicit,
-    String pubkey,
-  ) async {
-    final found = await _resolveRelaysOrEmpty(explicit, pubkey);
-    if (found.isEmpty) {
-      throw StateError(
-        'No relays available: pass `relays:` explicitly, or publish a NIP-65 '
-        'relay list (kind 10002) for $pubkey first.',
-      );
-    }
-    return found;
-  }
+  /// [explicit] if non-empty, otherwise the author's NIP-65 write relays,
+  /// looked up by the outbox worker so writes never wait on the network.
+  RelaySet _writeRelaySet(List<String>? explicit, String pubkey) =>
+      explicit != null && explicit.isNotEmpty
+      ? RelaySet.explicit(explicit)
+      : RelaySet.outbox(pubkey);
 
   /// Resolves the NIP-44 plaintext for [event], using the persistent
   /// decryption cache first and the [signer] only as a last resort.
@@ -126,9 +118,9 @@ class AppendOnlyLists {
     return null;
   }
 
-  /// Like [_resolveRelays] but returns an empty list instead of throwing -
-  /// used by read methods, where missing relays just degrade to "projection
-  /// only" rather than blocking the call.
+  /// Returns [explicit] if non-empty, otherwise the author's NIP-65 write
+  /// relays via NDK, or an empty list. Used by read methods, where missing
+  /// relays just degrade to "projection only" rather than blocking the call.
   Future<List<String>> _resolveRelaysOrEmpty(
     List<String>? explicit,
     String pubkey,
@@ -278,9 +270,9 @@ class AppendOnlyLists {
   /// [signer] is optional - when omitted, the signer of the currently
   /// logged-in NDK account is used. Throws if neither is available.
   ///
-  /// [relays] is optional - when null or empty, the author's NIP-65 write
-  /// relays (resolved via NDK) are used. Throws if no NIP-65 list can be
-  /// found for the author.
+  /// [relays] is optional. When null or empty, the event targets the author's
+  /// NIP-65 write relays, looked up later by [outbox], offline included. If
+  /// the author has no NIP-65, the queued entry ends up failed.
   ///
   /// The event is signed, persisted to the NDK cache and the projection
   /// before being enqueued for delivery, so [getList] / [watchList]
@@ -297,7 +289,7 @@ class AppendOnlyLists {
       op: AppendOnlyListOp.add,
       listName: listName,
       entries: entries,
-      relays: await _resolveRelays(relays, eventSigner.getPublicKey()),
+      relaySet: _writeRelaySet(relays, eventSigner.getPublicKey()),
     );
   }
 
@@ -316,7 +308,7 @@ class AppendOnlyLists {
       op: AppendOnlyListOp.remove,
       listName: listName,
       entries: entries,
-      relays: await _resolveRelays(relays, eventSigner.getPublicKey()),
+      relaySet: _writeRelaySet(relays, eventSigner.getPublicKey()),
     );
   }
 
@@ -416,7 +408,7 @@ class AppendOnlyLists {
   }) async {
     final eventSigner = _requireSigner(signer);
     final pubkey = eventSigner.getPublicKey();
-    final resolvedRelays = await _resolveRelays(relays, pubkey);
+    final relaySet = _writeRelaySet(relays, pubkey);
     final state = await projection.load(pubkey: pubkey, listName: listName);
     final present = state.entries.toList();
 
@@ -436,7 +428,7 @@ class AppendOnlyLists {
           op: AppendOnlyListOp.add,
           listName: listName,
           entries: chunk,
-          relays: resolvedRelays,
+          relaySet: relaySet,
         );
       }
     }
@@ -458,7 +450,7 @@ class AppendOnlyLists {
         await _cache.saveEvent(signedDeletion);
         await outbox.broadcast(
           signedDeletion,
-          relays: resolvedRelays,
+          relaySet: relaySet,
           pubkey: pubkey,
         );
       }
@@ -686,7 +678,7 @@ class AppendOnlyLists {
     required AppendOnlyListOp op,
     required String listName,
     required List<AppendOnlyListEntry> entries,
-    required List<String> relays,
+    required RelaySet relaySet,
   }) async {
     if (!signer.canSign()) {
       throw StateError('Signer cannot sign - required for append-only writes.');
@@ -720,7 +712,7 @@ class AppendOnlyLists {
     if (parsed != null) {
       await _applyToProjection(parsed);
     }
-    return outbox.broadcast(signed, relays: relays, pubkey: pubkey);
+    return outbox.broadcast(signed, relaySet: relaySet, pubkey: pubkey);
   }
 
   Future<AppendOnlyListState> _replayCache({

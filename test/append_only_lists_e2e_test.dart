@@ -1,5 +1,5 @@
 import 'package:broadcast_queue_shim_for_ndk/broadcast_queue_shim_for_ndk.dart';
-import 'package:ndk/entities.dart' show ReadWriteMarker, UserRelayList;
+import 'package:ndk/entities.dart' show Nip65;
 import 'package:ndk/ndk.dart';
 import 'package:nip_append_only_list/nip_append_only_list.dart';
 import 'package:sembast/sembast_memory.dart';
@@ -17,10 +17,10 @@ void main() {
     late String pubkey;
 
     setUp(() async {
-      relay = MockRelay();
-      await relay.start();
+      relay = MockRelay(name: 'append-only-lists');
+      await relay.startServer();
 
-      ndk = ndkForRelay(relay);
+      ndk = _ndkForRelay(relay);
 
       final outboxDb = await newDatabaseFactoryMemory().openDatabase(
         'outbox.db',
@@ -29,7 +29,11 @@ void main() {
         'projection.db',
       );
 
-      outbox = OfflineBroadcast.withNdk(ndk, db: outboxDb);
+      outbox = OfflineBroadcast.withNdk(
+        ndk,
+        db: outboxDb,
+        relayListDiscoveryRelays: [relay.url],
+      );
       outbox.start();
 
       lists = AppendOnlyLists(
@@ -48,7 +52,7 @@ void main() {
       await lists.dispose();
       await outbox.dispose();
       await ndk.destroy();
-      await relay.stop();
+      await relay.stopServer();
     });
 
     test(
@@ -84,7 +88,7 @@ void main() {
         );
 
         // What did the relay actually receive?
-        final kinds = relay.receivedEvents.map((e) => e['kind']).toList();
+        final kinds = relay.receivedEvents.map((e) => e.kind).toList();
         expect(kinds, containsAll([kindAdd, kindRemove]));
       },
     );
@@ -104,7 +108,7 @@ void main() {
       await ndk.destroy();
 
       // Bring a brand-new stack up, pointing at the same relay.
-      final ndk2 = ndkForRelay(relay);
+      final ndk2 = _ndkForRelay(relay);
       final outboxDb2 = await newDatabaseFactoryMemory().openDatabase(
         'outbox2.db',
       );
@@ -163,17 +167,17 @@ void main() {
     test(
       'add auto-resolves NIP-65 write relays when relays: omitted',
       () async {
-        // Seed the NDK cache with a NIP-65 list whose only write relay is
-        // the mock. With this in place, the resolver should pick that URL
-        // without an explicit `relays:` argument.
-        await ndk.config.cache.saveUserRelayList(
-          UserRelayList(
+        final nip65 = await signer.sign(
+          Nip01Event(
             pubKey: pubkey,
-            relays: {relay.url: ReadWriteMarker.readWrite},
-            createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-            refreshedTimestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+            kind: Nip65.kKind,
+            tags: [
+              ['r', relay.url],
+            ],
+            content: '',
           ),
         );
+        await ndk.config.cache.saveEvent(nip65);
 
         await lists.add(
           listName: 'fruits',
@@ -182,21 +186,32 @@ void main() {
         );
 
         await _waitForRelayCount(relay, 1);
-        expect(relay.receivedEvents.single['kind'], equals(kindAdd));
+        expect(relay.receivedEvents.single.kind, equals(kindAdd));
       },
     );
 
     test(
-      'add throws when neither relays: nor NIP-65 list is available',
+      'add without relays: applies locally, then fails in the queue when the '
+      'author has no NIP-65',
       () async {
-        // No NIP-65 cached, no explicit relays passed → should throw.
-        expect(
-          () => lists.add(
-            listName: 'fruits',
-            entries: const [AppendOnlyListEntry(tag: 't', value: 'apple')],
-          ),
-          throwsStateError,
+        final queued = await lists.add(
+          listName: 'fruits',
+          entries: const [AppendOnlyListEntry(tag: 't', value: 'apple')],
         );
+        expect(queued.relays, isEmpty);
+
+        final local = await lists.projection.load(
+          pubkey: pubkey,
+          listName: 'fruits',
+        );
+        expect(local.entries.map((e) => e.value), equals(['apple']));
+
+        final settled = await outbox
+            .watch(queued.id, pubkey: pubkey)
+            .firstWhere((b) => b?.status == BroadcastStatus.failed)
+            .timeout(const Duration(seconds: 5));
+        expect(settled!.resolutionError, isNotNull);
+        expect(relay.receivedEvents, isEmpty);
       },
     );
 
@@ -322,10 +337,10 @@ void main() {
         await _waitForRelayCount(relay, 4, timeout: const Duration(seconds: 5));
 
         final adds = relay.receivedEvents
-            .where((e) => e['kind'] == kindAdd)
+            .where((e) => e.kind == kindAdd)
             .toList();
         final deletions = relay.receivedEvents
-            .where((e) => e['kind'] == 5)
+            .where((e) => e.kind == 5)
             .toList();
 
         // 1 original Add + at least 2 fresh Adds from the split.
@@ -334,18 +349,12 @@ void main() {
         // each carry fewer entries than the original.
         final freshAdds = adds.sublist(1);
         for (final fresh in freshAdds) {
-          final tCount = (fresh['tags'] as List)
-              .cast<List>()
-              .where((t) => t[0] == 't')
-              .length;
-          expect(tCount, lessThan(6));
+          expect(fresh.getTags('t').length, lessThan(6));
         }
         // The fresh Adds collectively cover every entry.
         final coveredValues = <String>{};
         for (final fresh in freshAdds) {
-          for (final tag in (fresh['tags'] as List).cast<List>()) {
-            if (tag[0] == 't') coveredValues.add(tag[1] as String);
-          }
+          coveredValues.addAll(fresh.getTags('t'));
         }
         expect(
           coveredValues,
@@ -374,7 +383,7 @@ void main() {
         // 1 original + 1 fresh Add + 1 deletion = 3.
         await _waitForRelayCount(relay, 3, timeout: const Duration(seconds: 5));
 
-        final originalAddId = relay.receivedEvents.first['id'] as String;
+        final originalAddId = relay.receivedEvents.first.id;
 
         // Tear device A down before bringing device B up. Two NDK
         // instances against the same WebSocket relay can race on the
@@ -385,7 +394,7 @@ void main() {
         await ndk.destroy();
 
         // Device B: brand-new stack pointing at the same relay.
-        final ndk2 = ndkForRelay(relay);
+        final ndk2 = _ndkForRelay(relay);
         final outboxDb2 = await newDatabaseFactoryMemory().openDatabase(
           'outbox-b.db',
         );
@@ -441,7 +450,7 @@ void main() {
         await outbox.dispose();
         await ndk.destroy();
 
-        final ndk2 = ndkForRelay(relay);
+        final ndk2 = _ndkForRelay(relay);
         final outboxDb2 = await newDatabaseFactoryMemory().openDatabase(
           'outbox-na.db',
         );
@@ -494,15 +503,9 @@ void main() {
       // Expect 3 originals + 1 fresh Add + 1 deletion = 5
       await _waitForRelayCount(relay, 5, timeout: const Duration(seconds: 5));
 
-      final deletions = relay.receivedEvents
-          .where((e) => e['kind'] == 5)
-          .toList();
+      final deletions = relay.receivedEvents.where((e) => e.kind == 5).toList();
       expect(deletions, hasLength(1));
-      final eTags = (deletions.single['tags'] as List)
-          .cast<List>()
-          .where((t) => t[0] == 'e')
-          .map((t) => t[1] as String)
-          .toList();
+      final eTags = deletions.single.getTags('e');
       // The deletion should reference the 3 superseded events.
       expect(eTags, hasLength(3));
     });
@@ -627,6 +630,17 @@ void main() {
       expect(removed.pubkey, equals(pubkey));
     });
   });
+}
+
+/// Builds an [Ndk] wired to a single [MockRelay] with an in-memory cache.
+Ndk _ndkForRelay(MockRelay relay) {
+  return Ndk(
+    NdkConfig(
+      eventVerifier: Bip340EventVerifier(),
+      cache: MemCacheManager(),
+      bootstrapRelays: [relay.url],
+    ),
+  );
 }
 
 /// Polls until [check] returns true or [timeout] elapses.
