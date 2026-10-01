@@ -277,6 +277,54 @@ void main() {
     );
 
     test(
+      'reads decrypt with the list owner account, not the active one',
+      () async {
+        await lists.add(
+          listName: 'fruits',
+          entries: const [
+            AppendOnlyListEntry(tag: 't', value: 'apple'),
+            AppendOnlyListEntry(tag: 't', value: 'banana', private: true),
+          ],
+          relays: [relay.url],
+        );
+        await _waitForRelayCount(relay, 1);
+
+        final cached = await ndk.config.cache.loadEvents(
+          pubKeys: [pubkey],
+          kinds: const [kindAdd, kindRemove],
+        );
+        await lists.projection.delete(pubkey: pubkey, listName: 'fruits');
+        await lists.projection.deleteDecryptedPlaintext(
+          cached.map((e) => e.id),
+        );
+
+        final other = const Bip340EventSignerFactory().createWithNewKeyPair();
+        ndk.accounts.loginExternalSigner(signer: other);
+        expect(ndk.accounts.getPublicKey(), other.getPublicKey());
+
+        final state = await lists.getList(
+          pubkey: pubkey,
+          listName: 'fruits',
+          forceRefresh: true,
+        );
+        expect(
+          state.entries.map((e) => e.value).toSet(),
+          equals({'apple', 'banana'}),
+        );
+        expect(state.pendingDecryptionEventIds, isEmpty);
+
+        await expectLater(
+          lists.decryptPending(
+            pubkey: other.getPublicKey(),
+            listName: 'fruits',
+            signer: signer,
+          ),
+          throwsStateError,
+        );
+      },
+    );
+
+    test(
       'private entries survive a re-fold without the signer (decryption cache hit)',
       () async {
         // Write a private entry while the signer is logged in. _emit

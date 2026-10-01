@@ -79,6 +79,14 @@ class AppendOnlyLists {
   EventSigner? _resolveSigner(EventSigner? explicit) =>
       explicit ?? _ndk.accounts.getLoggedAccount()?.signer;
 
+  /// The signer able to decrypt [pubkey]'s lists: [explicit], otherwise
+  /// [pubkey]'s NDK account, active or not. Private entries are
+  /// self-encrypted, so a signer for another key yields `null`.
+  EventSigner? _decryptionSigner(EventSigner? explicit, String pubkey) {
+    final signer = explicit ?? _ndk.accounts.accounts[pubkey]?.signer;
+    return signer?.getPublicKey() == pubkey ? signer : null;
+  }
+
   /// Same as [_resolveSigner] but throws when no signer can be resolved -
   /// used by write methods where signing is mandatory.
   EventSigner _requireSigner(EventSigner? explicit) {
@@ -157,8 +165,9 @@ class AppendOnlyLists {
   /// the engine's staleness. Otherwise the pass runs in the background and
   /// [watchList] observers see what it brings.
   ///
-  /// [signer] is optional; if provided, encrypted content is decrypted and
-  /// merged into the projection on the fly.
+  /// [signer] is optional and defaults to [pubkey]'s NDK account, whichever
+  /// account is active. When one is available, encrypted content is
+  /// decrypted and merged into the projection on the fly.
   Future<AppendOnlyListState> getList({
     required String pubkey,
     required String listName,
@@ -167,7 +176,7 @@ class AppendOnlyLists {
     Duration timeout = const Duration(seconds: 5),
     List<String>? relays,
   }) async {
-    signer = _resolveSigner(signer);
+    signer = _decryptionSigner(signer, pubkey);
     final resolvedRelays = await _resolveRelaysOrEmpty(relays, pubkey);
     var state = await projection.load(pubkey: pubkey, listName: listName);
 
@@ -211,7 +220,7 @@ class AppendOnlyLists {
     EventSigner? signer,
     List<String>? relays,
   }) {
-    signer = _resolveSigner(signer);
+    signer = _decryptionSigner(signer, pubkey);
     final key = _key(pubkey, listName);
     final existing = _controllers[key];
     if (existing != null && !existing.isClosed) {
@@ -408,7 +417,13 @@ class AppendOnlyLists {
     required String listName,
     EventSigner? signer,
   }) async {
-    final eventSigner = _requireSigner(signer);
+    final eventSigner = _decryptionSigner(signer, pubkey);
+    if (eventSigner == null) {
+      throw StateError(
+        'No signer for $pubkey: pass its `signer:` explicitly, or add its '
+        'account to the injected Ndk instance first.',
+      );
+    }
     final current = await projection.load(pubkey: pubkey, listName: listName);
     if (current.pendingDecryptionEventIds.isEmpty) return current;
 

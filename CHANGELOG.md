@@ -18,6 +18,11 @@
   `overlapMargin` (new, default 7 days) further back.
 - Fix: a relay that timed out or answered `CLOSED` had its range recorded as
   covered, so what it held was never fetched again. Only an `EOSE` counts now.
+- Fix: `getList`, `watchList` and `decryptPending` decrypted every list with
+  the active NDK account, so the private entries of another logged-in
+  account's list never showed. They now decrypt with the list owner's
+  account, active or not. `decryptPending` throws when no signer for that
+  pubkey is available, instead of trying the active account.
 - `watchList` holds the list on the engine while listened to, so the list is
   backfilled and then revisited on its own. The live subscription still
   carries new events as they are published.
